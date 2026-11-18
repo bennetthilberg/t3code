@@ -1121,6 +1121,7 @@ const backgroundCommandHarness = Effect.fn("backgroundCommandHarness")(function*
     },
     usageUpdate(10_852),
   ],
+  profileDirectory?: string,
 ) {
   const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const path = yield* Path.Path;
@@ -1177,6 +1178,7 @@ const backgroundCommandHarness = Effect.fn("backgroundCommandHarness")(function*
       ),
     withProcess: (_stop, task) => task,
     defaultModel: Effect.undefined,
+    ...(profileDirectory === undefined ? {} : { profileDirectory }),
   });
   const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
     runtimeMode: "full-access",
@@ -1279,7 +1281,23 @@ describe("AntigravityAdapterV2 background commands", () => {
 
   it.effect("keeps a backgrounded command awaited and answers its reaction in a new run", () =>
     Effect.gen(function* () {
-      const harness = yield* backgroundCommandHarness();
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const profile = yield* fileSystem.realPath(
+        yield* fileSystem.makeTempDirectoryScoped({ prefix: "antigravity-profile-" }),
+      );
+      // The agent writes the command's output here as it runs, and on the wire only at its end.
+      const tasks = path.join(
+        profile,
+        "antigravity-acp",
+        "brain",
+        "mock-session-1",
+        ".system_generated",
+        "tasks",
+      );
+      yield* fileSystem.makeDirectory(tasks, { recursive: true });
+      yield* fileSystem.writeFileString(path.join(tasks, "task-2.log"), "warming up\r\n");
+      const harness = yield* backgroundCommandHarness(undefined, profile);
       yield* harness.startTurn(1, false);
       const first = yield* harness.eventsUntil((event) => event.type === "turn.terminal");
       const terminal = first.at(-1);
@@ -1296,6 +1314,18 @@ describe("AntigravityAdapterV2 background commands", () => {
           ? running.turnItem.completionWake
           : null,
         "always",
+      );
+      const isOutput = (event: ProviderAdapter.ProviderAdapterV2Event) =>
+        event.type === "command_output.delta";
+      const output = first.find(isOutput) ?? (yield* harness.eventsUntil(isOutput)).find(isOutput);
+      assert.deepEqual(
+        output?.type === "command_output.delta"
+          ? { itemId: output.itemId, chunk: output.chunk }
+          : null,
+        {
+          itemId: running?.type === "turn_item.updated" ? running.turnItem.id : null,
+          chunk: "warming up\r\n",
+        },
       );
       const roster = lastRoster(first);
       assert.deepEqual(
@@ -1379,7 +1409,7 @@ describe("AntigravityAdapterV2 background commands", () => {
         [],
       );
       assert.isFalse(yield* harness.session.hasPendingBackgroundWork!);
-    }).pipe(Effect.provide(layerSession)),
+    }).pipe(Effect.scoped, Effect.provide(layerSession)),
   );
 
   it.effect("lets the agent release a command it leaves running, by its own task id", () =>

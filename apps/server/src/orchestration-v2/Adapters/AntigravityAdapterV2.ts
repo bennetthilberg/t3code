@@ -33,6 +33,7 @@ import {
   describeAntigravitySubagentLaunches,
 } from "../../provider/acp/AntigravityChildWork.ts";
 import { readAntigravityClientTextFile } from "../../provider/acp/AntigravityClientFiles.ts";
+import { makeAntigravityTaskLogs } from "../../provider/acp/AntigravityTaskLogs.ts";
 import { watchAntigravityPromptOutcome } from "../../provider/acp/AntigravityTurnOutcome.ts";
 import {
   antigravityApprovalOptions,
@@ -142,6 +143,8 @@ export function makeAntigravityAcpAdapterFlavor(
   options: AntigravityAdapterV2Options & AntigravityFlavorServices,
 ): AcpAdapterV2Flavor {
   const { profileDirectory } = options;
+  const tailTaskLog =
+    profileDirectory === undefined ? undefined : makeAntigravityTaskLogs(profileDirectory);
   // Each runtime tracks its own open commands; their ids are unique, so the result is shared.
   const backgroundedCommandIds = new Set<string>();
   const backgroundCommandTaskId = (toolCall: { readonly toolCallId: string }) =>
@@ -315,6 +318,14 @@ export function makeAntigravityAcpAdapterFlavor(
     continuationStepEnded: (update) => update.sessionUpdate === "usage_update",
     continuationQuietFallback: "2 minutes",
     t3InstructionsNote: ANTIGRAVITY_T3_INSTRUCTIONS_NOTE,
+    ...(tailTaskLog === undefined
+      ? {}
+      : {
+          tailBackgroundCommandOutput: (input) =>
+            tailTaskLog(input).pipe(
+              Effect.provideService(FileSystem.FileSystem, options.fileSystem),
+            ),
+        }),
     supportsImagePrompts: true,
     // ACP 1.3.0 treats /compact as ordinary model input.
     supportsCompaction: false,

@@ -621,6 +621,16 @@ export interface AcpAdapterV2Flavor {
    */
   readonly backgroundCommandsWakeAgent?: boolean;
   /**
+   * Streams the output of a command the agent moved to the background, which the agent reports
+   * only when the command ends. Returns once `stop` completes, after a final read.
+   */
+  readonly tailBackgroundCommandOutput?: (input: {
+    readonly sessionId: string;
+    readonly startedAt: number;
+    readonly stop: Deferred.Deferred<void>;
+    readonly onChunk: (chunk: string) => Effect.Effect<void>;
+  }) => Effect.Effect<void>;
+  /**
    * For reactive turns with no end marker: a continuation run settles only once the last root
    * update ended a model step, or after `continuationQuietFallback` with no updates at all.
    */
@@ -2483,7 +2493,10 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               }
               return next;
             });
-            if (!running) yield* unrosterBackgroundCommand(taskId);
+            if (!running) {
+              yield* stopBackgroundCommandOutput([taskId]);
+              yield* unrosterBackgroundCommand(taskId);
+            }
           });
 
         const markBackgroundTaskEnded = (taskId: string) =>
@@ -2525,6 +2538,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
         // their end owes has started. Root thread updates always carry the current roster.
         const backgroundCommandRoster = new Map<string, OrchestrationV2PendingBackgroundTask>();
         const owedBackgroundCommandWakes = new Set<string>();
+        const backgroundCommandOutputTails = new Map<string, Deferred.Deferred<void>>();
         let backgroundCommandRosterOwner: ProviderThreadId | null = null;
         const withBackgroundCommandRoster = (
           event: ProviderAdapter.ProviderAdapterV2Event,
@@ -2578,7 +2592,44 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             runId: context.input.runId,
           });
           yield* publishBackgroundCommandRoster();
+          const startedAt = context.toolStartedAt.get(tool.toolCallId);
+          if (
+            flavor.tailBackgroundCommandOutput === undefined ||
+            startedAt === undefined ||
+            backgroundCommandOutputTails.has(taskId)
+          ) {
+            return;
+          }
+          const stop = yield* Deferred.make<void>();
+          backgroundCommandOutputTails.set(taskId, stop);
+          const threadId = context.input.threadId;
+          const itemId = providerTurnItemId(`${context.nativeThreadId}:tool:${tool.toolCallId}`);
+          yield* flavor
+            .tailBackgroundCommandOutput({
+              sessionId: context.nativeThreadId,
+              startedAt: DateTime.toEpochMillis(startedAt),
+              stop,
+              onChunk: (chunk) =>
+                emitProviderEvent({
+                  type: "command_output.delta",
+                  driver,
+                  threadId,
+                  itemId,
+                  chunk,
+                }),
+            })
+            .pipe(Effect.forkIn(sessionScope));
         });
+        const stopBackgroundCommandOutput = (taskIds: Iterable<string>) =>
+          Effect.forEach(
+            Array.from(taskIds),
+            (taskId) => {
+              const stop = backgroundCommandOutputTails.get(taskId);
+              backgroundCommandOutputTails.delete(taskId);
+              return stop === undefined ? Effect.void : Deferred.succeed(stop, undefined);
+            },
+            { discard: true },
+          );
         /** An end the agent will react to stays awaited until that reaction's run starts. */
         const unrosterBackgroundCommand = Effect.fnUntraced(function* (taskId: string) {
           if (!backgroundCommandRoster.has(taskId) || owedBackgroundCommandWakes.has(taskId))
@@ -2602,6 +2653,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
           if (changed) yield* publishBackgroundCommandRoster();
         });
         const clearBackgroundCommandRoster = Effect.fnUntraced(function* () {
+          yield* stopBackgroundCommandOutput(backgroundCommandOutputTails.keys());
           if (backgroundCommandRoster.size === 0) return;
           backgroundCommandRoster.clear();
           owedBackgroundCommandWakes.clear();
