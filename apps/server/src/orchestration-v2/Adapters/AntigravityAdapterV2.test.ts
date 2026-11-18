@@ -1122,6 +1122,8 @@ const usageUpdate = (used: number): EffectAcpSchema.SessionUpdate => ({
 const backgroundCommandHarness = Effect.fn("backgroundCommandHarness")(function* (
   options: {
     readonly firstTurn?: ReadonlyArray<EffectAcpSchema.SessionUpdate>;
+    /** What prompts after the first send; the first turn's frames by default. */
+    readonly laterTurns?: ReadonlyArray<EffectAcpSchema.SessionUpdate>;
     readonly profileDirectory?: string;
     /** Like antigravity-acp, the first prompt ends with `end_turn` once a second one arrives. */
     readonly endPromptOnSteer?: boolean;
@@ -1139,6 +1141,7 @@ const backgroundCommandHarness = Effect.fn("backgroundCommandHarness")(function*
     ],
     profileDirectory,
   } = options;
+  let prompts = 0;
   const steers = yield* Queue.unbounded<unknown>();
   const steerArrived = yield* Deferred.make<void>();
   const steerAnswer = yield* Deferred.make<EffectAcpSchema.PromptResponse>();
@@ -1194,7 +1197,15 @@ const backgroundCommandHarness = Effect.fn("backgroundCommandHarness")(function*
               ? Effect.void
               : Deferred.succeed(promptOptions.dispatched, undefined)
             ).pipe(
-              Effect.andThen(Effect.forEach(firstTurn, send, { discard: true })),
+              Effect.andThen(
+                Effect.suspend(() =>
+                  Effect.forEach(
+                    prompts++ === 0 ? firstTurn : (options.laterTurns ?? firstTurn),
+                    send,
+                    { discard: true },
+                  ),
+                ),
+              ),
               Effect.andThen(
                 options.endPromptOnSteer === true ? Deferred.await(steerArrived) : Effect.void,
               ),
@@ -1514,6 +1525,38 @@ describe("AntigravityAdapterV2 background commands", () => {
       });
       assert.equal(yield* Queue.size(harness.offers), 0);
       assert.isFalse(yield* harness.session.hasPendingBackgroundWork!);
+    }).pipe(Effect.provide(layerSession)),
+  );
+});
+
+describe("AntigravityAdapterV2 force stop", () => {
+  it.effect("ends an earlier turn's backgrounded command when Stop restarts the runtime", () =>
+    Effect.gen(function* () {
+      const harness = yield* backgroundCommandHarness({ laterTurns: [usageUpdate(11_000)] });
+      yield* harness.startTurn(1, false);
+      const first = yield* harness.eventsUntil((event) => event.type === "turn.terminal");
+      // A user turn starts while the first turn's command still runs in the background.
+      yield* harness.startTurn(2, false);
+      const second = yield* harness.eventsUntil((event) => event.type === "provider_turn.updated");
+      const turn = second.at(-1);
+      assert.equal(turn?.type, "provider_turn.updated");
+      if (turn?.type !== "provider_turn.updated") return;
+      yield* harness.session.interruptTurn({
+        providerThread: harness.providerThread,
+        providerTurnId: turn.providerTurn.id,
+        requestRuntimeRestart: true,
+      });
+      const stopped = yield* harness.eventsUntil(
+        (event) =>
+          event.type === "turn_item.updated" &&
+          event.turnItem.nativeItemRef?.nativeId === "call_background" &&
+          event.turnItem.status !== "running",
+      );
+      const command = commandItem([...first, ...second, ...stopped]);
+      assert.equal(
+        command?.type === "turn_item.updated" ? command.turnItem.status : null,
+        "interrupted",
+      );
     }).pipe(Effect.provide(layerSession)),
   );
 });

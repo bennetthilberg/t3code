@@ -376,6 +376,18 @@ export function makeAntigravityBackgroundCommands(
     },
     /** The prompt returned, so every command still open runs on in the background. */
     promptSettled: () => mark(),
+    /** A cancelled prompt's commands died with it. */
+    promptCancelled: () => open.clear(),
+    /** Call once `notification` is handled: a command it ends no longer needs its id kept. */
+    handled: (notification: EffectAcpSchema.SessionNotification) => {
+      const update = notification.update;
+      if (
+        (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") &&
+        (update.status === "completed" || update.status === "failed")
+      ) {
+        backgrounded.delete(update.toolCallId);
+      }
+    },
   };
 }
 

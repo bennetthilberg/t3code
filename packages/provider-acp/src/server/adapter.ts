@@ -7105,7 +7105,11 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                 postSettleContinuationEnabled &&
                 (yield* Ref.get(activeTurn)) === null &&
                 nativeParams.sessionId === (yield* Ref.get(activeSessionId)) &&
-                !(yield* awaitRequestTurn(handlerGeneration, true))
+                // A reaction no run takes, as when its continuation is declined, must not block the agent.
+                !(yield* awaitRequestTurn(handlerGeneration, true).pipe(
+                  Effect.timeoutOption("2 minutes"),
+                  Effect.map(Option.getOrElse(() => false)),
+                ))
               ) {
                 return { outcome: { outcome: "cancelled" } } as const;
               }
@@ -7760,6 +7764,8 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             yield* Ref.set(completedCompactionIds, new Set());
             yield* Ref.set(providerTurns, new Map());
             yield* Ref.set(snapshot, emptySnapshotState());
+            // The replaced process took its background commands with it.
+            yield* abandonBackgroundCommands(yield* Ref.get(activeTurn));
             yield* continuationPermit.withPermit(
               Effect.gen(function* () {
                 yield* Ref.update(continuationGeneration, (value) => value + 1);
@@ -8276,22 +8282,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               Effect.ignore,
             );
           }
-          const owners = new Map(yield* Ref.get(detachedBackgroundCommands));
-          if (input.context !== null) {
-            for (const taskId of input.context.backgroundCommands.keys()) {
-              owners.set(taskId, input.context);
-            }
-          }
-          for (const [taskId, owner] of owners) {
-            if (!running.has(taskId)) continue;
-            const toolCallId = owner.toolCallIdsByBackgroundTaskId.get(taskId);
-            const tool = toolCallId === undefined ? undefined : owner.tools.get(toolCallId);
-            if (tool !== undefined) {
-              yield* emitTool(owner, { ...tool, status: "failed" }, "interrupted");
-            }
-          }
-          yield* quarantineStoppedRun();
-          yield* clearBackgroundCommandRoster();
+          yield* quarantineStoppedRun(input.context);
           return true;
         });
 
@@ -8314,7 +8305,31 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
             Deferred.await(context.completed).pipe(Effect.as(false)),
           );
         });
-        const quarantineStoppedRun = Effect.fnUntraced(function* () {
+        /** A self-waking agent's commands T3 stops or loses end interrupted and leave the roster. */
+        const abandonBackgroundCommands = Effect.fnUntraced(function* (
+          context: ActiveAcpTurn | null,
+        ) {
+          if (flavor.backgroundCommandsWakeAgent !== true) return;
+          const running = yield* Ref.get(runningBackgroundTaskIds);
+          const owners = new Map(yield* Ref.get(detachedBackgroundCommands));
+          if (context !== null) {
+            for (const taskId of context.backgroundCommands.keys()) owners.set(taskId, context);
+          }
+          for (const [taskId, owner] of owners) {
+            if (!running.has(taskId)) continue;
+            const toolCallId = owner.toolCallIdsByBackgroundTaskId.get(taskId);
+            const tool = toolCallId === undefined ? undefined : owner.tools.get(toolCallId);
+            if (tool !== undefined) {
+              yield* emitTool(owner, { ...tool, status: "failed" }, "interrupted");
+            }
+          }
+          yield* clearBackgroundCommandRoster();
+        });
+
+        const quarantineStoppedRun = Effect.fnUntraced(function* (context?: ActiveAcpTurn | null) {
+          yield* abandonBackgroundCommands(
+            context === undefined ? yield* Ref.get(activeTurn) : context,
+          );
           yield* continuationPermit.withPermit(
             Effect.gen(function* () {
               yield* Ref.update(continuationGeneration, (value) => value + 1);
@@ -9686,10 +9701,12 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
               // Sent before the turn's own prompt, a steer would reach the agent as that prompt.
               // A run the agent started itself has no prompt to wait for.
               if (!context.isContinuation) {
-                const dispatched = yield* Effect.raceFirst(
+                const dispatched = yield* Effect.raceAll([
                   Deferred.await(context.promptDispatched).pipe(Effect.as(true)),
                   Deferred.await(context.promptWireSettled).pipe(Effect.as(false)),
-                );
+                  // A prompt that fails before it goes out settles only the turn.
+                  Deferred.await(context.completed).pipe(Effect.as(false)),
+                ]);
                 if (!dispatched) {
                   return yield* new ProviderAdapter.ProviderAdapterProtocolError({
                     driver,
@@ -9799,7 +9816,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                             agentWork = null;
                             agentRequests.clear();
                             nativeChildren.clear();
-                            yield* quarantineStoppedRun();
+                            yield* quarantineStoppedRun(context);
                             if (context !== null) context.interrupted = true;
                             yield* cancelPendingRuntimeRequests();
                             yield* terminalizeCarryoverSubagents(carryover);
@@ -9985,7 +10002,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                     const runTransition = Effect.gen(function* () {
                       context.interrupted = true;
                       if (hardRestart || turnInput.requestRuntimeRestart === true) {
-                        yield* quarantineStoppedRun();
+                        yield* quarantineStoppedRun(context);
                       }
                       // A settled soft interrupt keeps background subagents, and with them their MCP calls.
                       yield* cancelPendingRuntimeRequests({ stopMcpCalls: !settledSoftInterrupt });

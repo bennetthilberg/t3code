@@ -142,7 +142,9 @@ const ANTIGRAVITY_T3_INSTRUCTIONS_NOTE = `## Antigravity in T3 Code
 - A \`run_command\` that goes to the background is tracked by T3, and you are woken in a new run when it ends. Ending your turn after launching one is fine; do not poll it. One you leave running on purpose, such as a dev server or watcher: call \`t3_background_wait\` with its task id and \`waiting=false\`.`;
 
 interface OpenAntigravityPrompt {
-  steered: Deferred.Deferred<EffectAcpSchema.PromptResponse, EffectAcpErrors.AcpError> | undefined;
+  readonly steered: Array<
+    Deferred.Deferred<EffectAcpSchema.PromptResponse, EffectAcpErrors.AcpError>
+  >;
 }
 
 type PromptUsage = NonNullable<EffectAcpSchema.PromptResponse["usage"]>;
@@ -176,9 +178,8 @@ const awaitSteeredPrompts = (
   open: OpenAntigravityPrompt,
   response: EffectAcpSchema.PromptResponse,
 ): Effect.Effect<EffectAcpSchema.PromptResponse, EffectAcpErrors.AcpError> => {
-  const steered = open.steered;
+  const steered = open.steered.shift();
   if (steered === undefined) return Effect.succeed(response);
-  open.steered = undefined;
   return Deferred.await(steered).pipe(
     Effect.flatMap((next) => {
       const usage = addPromptUsage(response.usage, next.usage);
@@ -276,7 +277,7 @@ export function makeAntigravityAcpAdapterFlavor(
           ),
         prompt: (payload, promptOptions) =>
           Effect.suspend(() => {
-            const open: OpenAntigravityPrompt = { steered: undefined };
+            const open: OpenAntigravityPrompt = { steered: [] };
             openPrompt = open;
             reads.reset();
             return runtime.prompt(payload, promptOptions).pipe(
@@ -290,10 +291,14 @@ export function makeAntigravityAcpAdapterFlavor(
           }).pipe(
             // Marking and re-reporting share the update lock, so the adapter settles this turn
             // only after every backgrounded command is registered as one.
-            Effect.tap(() =>
+            Effect.tap((response) =>
               updates.withPermit(
                 Effect.suspend(() => {
                   const project = projectUpdate;
+                  if (response.stopReason === "cancelled") {
+                    backgroundCommands.promptCancelled();
+                    return Effect.void;
+                  }
                   const marked = backgroundCommands.promptSettled();
                   return project === undefined
                     ? Effect.void
@@ -309,7 +314,9 @@ export function makeAntigravityAcpAdapterFlavor(
               Effect.suspend(() => {
                 const repaired = reads.repair(notification);
                 const marked = backgroundCommands.observe(repaired);
-                return Effect.forEach([...marked, repaired], handler, { discard: true });
+                return Effect.forEach([...marked, repaired], handler, { discard: true }).pipe(
+                  Effect.tap(() => Effect.sync(() => backgroundCommands.handled(repaired))),
+                );
               }),
             ),
           );
@@ -330,7 +337,7 @@ export function makeAntigravityAcpAdapterFlavor(
             EffectAcpErrors.AcpError
           >();
           // With no prompt open, as in a run the agent started itself, step ends settle the run.
-          if (openPrompt !== undefined) openPrompt.steered = steered;
+          openPrompt?.steered.push(steered);
           yield* runtime.request("session/prompt", { sessionId, prompt }).pipe(
             Effect.flatMap(decodeSteeredPromptResponse),
             Effect.exit,

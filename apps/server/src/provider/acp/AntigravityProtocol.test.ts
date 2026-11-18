@@ -62,6 +62,17 @@ describe("Antigravity background commands", () => {
     expect(commands.isBackgrounded("call_fast")).toBe(false);
     expect(commands.isBackgrounded("call_slow")).toBe(true);
     expect(commands.observe(usage)).toEqual([]);
+    // Once its end is handled, the id is no longer kept.
+    commands.handled(command("call_slow", "completed"));
+    expect(commands.isBackgrounded("call_slow")).toBe(false);
+  });
+
+  it("does not mark the commands of a cancelled prompt, which died with it", () => {
+    const commands = makeAntigravityBackgroundCommands();
+    commands.observe(command("call_killed", "in_progress"));
+    commands.promptCancelled();
+    expect(commands.observe(usage)).toEqual([]);
+    expect(commands.promptSettled()).toEqual([]);
   });
 
   it("leaves another runtime's open command to that runtime's own prompt", () => {

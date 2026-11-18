@@ -55,6 +55,12 @@ describe("makeAntigravityTaskLogs", () => {
         const first = yield* follow(now - 2_000);
         const second = yield* follow(now - 1_000);
 
+        // A command that backgrounded and already ended has a step output; its log is not theirs.
+        yield* fileSystem.writeFileString(log(tasks(SESSION_ID), "task-3.log"), "ended\r\n");
+        const endedStep = log(tasks(SESSION_ID), "..", "steps", "3");
+        yield* fileSystem.makeDirectory(endedStep, { recursive: true });
+        yield* fileSystem.writeFileString(log(endedStep, "output.txt"), "ended\r\n");
+
         const firstLog = log(tasks(SESSION_ID), "task-4.log");
         yield* fileSystem.writeFileString(firstLog, "first 0\r\n");
         yield* fileSystem.writeFileString(log(tasks(SESSION_ID), "task-12.log"), "second 0\r\n");

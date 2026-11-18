@@ -34,11 +34,8 @@ export function makeAntigravityTaskLogs(profileDirectory: string) {
       try: async () => {
         const root = await antigravityProfileRoot(profileDirectory);
         if (root === undefined) return [];
-        const tasks = await antigravityManagedPath(
-          root,
-          ["antigravity-acp", "brain", sessionId, ".system_generated", "tasks"],
-          "directory",
-        );
+        const generated = ["antigravity-acp", "brain", sessionId, ".system_generated"];
+        const tasks = await antigravityManagedPath(root, [...generated, "tasks"], "directory");
         if (tasks === undefined) return [];
         const logs: Array<{ readonly file: string; readonly step: number }> = [];
         for (const name of await NodeFSP.readdir(tasks.path)) {
@@ -47,6 +44,16 @@ export function makeAntigravityTaskLogs(profileDirectory: string) {
           const file = NodePath.join(tasks.path, name);
           const info = await NodeFSP.lstat(file).catch(() => undefined);
           if (info?.isFile() !== true || info.mtimeMs < since) continue;
+          // A step's output file appears when its command ends. A finished command needs no tail,
+          // and its log, left unclaimed, would take a waiting command's place in the order.
+          const output = NodePath.join(root, ...generated, "steps", step, "output.txt");
+          if (
+            await NodeFSP.lstat(output).then(
+              () => true,
+              () => false,
+            )
+          )
+            continue;
           logs.push({ file, step: Number(step) });
         }
         return logs.toSorted((left, right) => left.step - right.step).map((log) => log.file);
