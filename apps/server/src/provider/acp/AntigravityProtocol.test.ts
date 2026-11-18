@@ -13,6 +13,7 @@ import {
   normalizeAntigravitySessionUpdate,
   normalizeAntigravityToolCall,
   sanitizeAntigravityToolPayload,
+  makeAntigravityBackgroundCommands,
   makeAntigravityReadRepair,
 } from "./AntigravityProtocol.ts";
 import {
@@ -22,6 +23,79 @@ import {
 import { acpToolCallDiffPatch } from "@t3tools/provider-acp/server/adapter";
 
 const isSessionNotification = Schema.is(AcpWireSchema.SessionNotification);
+
+describe("Antigravity background commands", () => {
+  const notification = (update: EffectAcpSchema.SessionUpdate) => ({
+    sessionId: "session-1",
+    update,
+  });
+  const command = (toolCallId: string, status: "in_progress" | "completed") =>
+    notification(
+      status === "in_progress"
+        ? {
+            sessionUpdate: "tool_call",
+            toolCallId,
+            title: "make test",
+            kind: "execute",
+            status,
+            rawInput: { CommandLine: "make test", WaitMsBeforeAsync: 10000 },
+          }
+        : { sessionUpdate: "tool_call_update", toolCallId, status },
+    );
+  const usage = notification({ sessionUpdate: "usage_update", used: 1, size: 2 });
+
+  it("marks a command backgrounded only once the model moved past it", () => {
+    const commands = makeAntigravityBackgroundCommands();
+    // The model step that calls a command reports its usage before the call.
+    expect(commands.observe(usage)).toEqual([]);
+    commands.observe(command("call_fast", "in_progress"));
+    commands.observe(command("call_fast", "completed"));
+    commands.observe(command("call_slow", "in_progress"));
+    // A later step can only end while the command runs on in the background.
+    expect(commands.observe(usage)).toEqual([
+      notification({
+        sessionUpdate: "tool_call_update",
+        toolCallId: "call_slow",
+        status: "in_progress",
+      }),
+    ]);
+    expect(commands.isBackgrounded("call_fast")).toBe(false);
+    expect(commands.isBackgrounded("call_slow")).toBe(true);
+    expect(commands.observe(usage)).toEqual([]);
+  });
+
+  it("leaves another runtime's open command to that runtime's own prompt", () => {
+    const shared = new Set<string>();
+    const first = makeAntigravityBackgroundCommands(shared);
+    const second = makeAntigravityBackgroundCommands(shared);
+    first.observe(command("call_first", "in_progress"));
+    second.observe({ ...command("call_second", "in_progress"), sessionId: "session-2" });
+    expect(first.promptSettled().map((marked) => marked.update)).toEqual([
+      { sessionUpdate: "tool_call_update", toolCallId: "call_first", status: "in_progress" },
+    ]);
+    expect(first.isBackgrounded("call_second")).toBe(false);
+    expect(second.promptSettled().map((marked) => marked.sessionId)).toEqual(["session-2"]);
+    expect(first.isBackgrounded("call_second")).toBe(true);
+  });
+
+  it("marks commands still open when the prompt returns", () => {
+    const commands = makeAntigravityBackgroundCommands();
+    commands.observe(command("call_open", "in_progress"));
+    commands.observe(
+      notification({
+        sessionUpdate: "tool_call",
+        toolCallId: "call_read",
+        title: "Read README.md",
+        kind: "read",
+        status: "in_progress",
+      }),
+    );
+    expect(commands.promptSettled().map((marked) => marked.update)).toEqual([
+      { sessionUpdate: "tool_call_update", toolCallId: "call_open", status: "in_progress" },
+    ]);
+    expect(commands.isBackgrounded("call_read")).toBe(false);
+  });
+});
 
 describe("native Antigravity subagent tools", () => {
   it("recognizes only native invocation titles and excludes MCP tools", () => {

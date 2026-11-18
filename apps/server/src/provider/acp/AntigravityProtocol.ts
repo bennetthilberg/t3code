@@ -310,6 +310,75 @@ export function makeAntigravityReadRepair() {
   };
 }
 
+const BACKGROUNDED_COMMAND_LIMIT = 256;
+
+function isAntigravityCommandUpdate(
+  update: Extract<
+    EffectAcpSchema.SessionUpdate,
+    { sessionUpdate: "tool_call" | "tool_call_update" }
+  >,
+) {
+  if (update.kind === "execute") return true;
+  const input = Option.getOrUndefined(decodeNativeToolFields(update.rawInput));
+  return input?.CommandLine !== undefined || input?.command_line !== undefined;
+}
+
+/**
+ * `run_command` blocks the model until it returns or `WaitMsBeforeAsync` passes; then the agent
+ * backgrounds it without a wire signal and the model moves on. A command still open when a later
+ * model step ends (`usage_update`) or the prompt returns has therefore been backgrounded. Its end
+ * arrives later as an ordinary update, and the agent then reacts in a turn of its own.
+ */
+export function makeAntigravityBackgroundCommands(
+  /** Shared by every runtime of one adapter; tool call ids are unique across sessions. */
+  backgrounded: Set<string> = new Set(),
+) {
+  const open = new Map<string, string>();
+  const mark = (sessionId?: string): Array<EffectAcpSchema.SessionNotification> => {
+    const marked: Array<EffectAcpSchema.SessionNotification> = [];
+    for (const [toolCallId, owner] of open) {
+      if (sessionId !== undefined && owner !== sessionId) continue;
+      open.delete(toolCallId);
+      backgrounded.add(toolCallId);
+      marked.push({
+        sessionId: owner,
+        update: { sessionUpdate: "tool_call_update", toolCallId, status: "in_progress" },
+      });
+    }
+    for (const oldest of backgrounded) {
+      if (backgrounded.size <= BACKGROUNDED_COMMAND_LIMIT) break;
+      backgrounded.delete(oldest);
+    }
+    return marked;
+  };
+  return {
+    isBackgrounded: (toolCallId: string) => backgrounded.has(toolCallId),
+    /** Updates to project ahead of `notification`, re-reporting commands it shows were backgrounded.
+     * Project them before releasing the lock that serializes updates, or a settle can miss them. */
+    observe: (
+      notification: EffectAcpSchema.SessionNotification,
+    ): Array<EffectAcpSchema.SessionNotification> => {
+      const update = notification.update;
+      if (update.sessionUpdate === "usage_update") return mark(notification.sessionId);
+      if (update.sessionUpdate !== "tool_call" && update.sessionUpdate !== "tool_call_update") {
+        return [];
+      }
+      if (update.status === "completed" || update.status === "failed") {
+        open.delete(update.toolCallId);
+      } else if (
+        (update.status === "pending" || update.status === "in_progress") &&
+        !backgrounded.has(update.toolCallId) &&
+        (open.has(update.toolCallId) || isAntigravityCommandUpdate(update))
+      ) {
+        open.set(update.toolCallId, notification.sessionId);
+      }
+      return [];
+    },
+    /** The prompt returned, so every command still open runs on in the background. */
+    promptSettled: () => mark(),
+  };
+}
+
 export function normalizeAntigravitySessionUpdate(
   notification: EffectAcpSchema.SessionNotification,
 ): EffectAcpSchema.SessionNotification {

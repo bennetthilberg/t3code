@@ -11,6 +11,7 @@ import {
   RunAttemptId,
   RunId,
   ThreadId,
+  isOrchestrationV2WorkActive,
 } from "@t3tools/contracts";
 import { resolveSelfInvocation } from "@t3tools/shared/nodeRuntime";
 import { htmlRenderFromToolItem } from "@t3tools/shared/toolOutput";
@@ -23,8 +24,10 @@ import * as FileSystem from "effect/FileSystem";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
+import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Stream from "effect/Stream";
+import * as TestClock from "effect/testing/TestClock";
 import { ChildProcessSpawner } from "effect/process";
 import type * as EffectAcpSchema from "effect-acp/compat";
 import * as EffectAcpErrors from "effect-acp/errors";
@@ -38,6 +41,7 @@ import { normalizeAntigravitySessionUpdate } from "../../provider/acp/Antigravit
 import { ANTIGRAVITY_SIGN_IN_REQUIRED_MESSAGE } from "../../provider/antigravityAuthSupport.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
+import { makeTurnInput } from "./AcpAdapterV2.testkit.ts";
 import {
   makeAntigravityAcpAdapterFlavor,
   makeAntigravityAdapterV2,
@@ -1074,6 +1078,374 @@ describe("AntigravityAdapterV2 subagent reads", () => {
       assert.deepEqual(read("call_missing"), failed);
       assert.deepEqual(read("call_denied"), failed);
       assert.deepEqual(read("call_unseen"), failed);
+    }).pipe(Effect.provide(layerSession)),
+  );
+});
+
+// Frames antigravity-acp 1.5.10 sent for a command that outlived `WaitMsBeforeAsync`.
+const BACKGROUND_COMMAND = "python3 -c \"import time; time.sleep(18); print('slept-ok')\"";
+const backgroundCommandUpdate = (
+  status: "in_progress" | "completed" | "failed",
+  output?: string,
+): EffectAcpSchema.SessionUpdate => ({
+  sessionUpdate: status === "in_progress" ? "tool_call" : "tool_call_update",
+  toolCallId: "call_background",
+  kind: "execute",
+  title: BACKGROUND_COMMAND,
+  status,
+  rawInput: {
+    CommandLine: BACKGROUND_COMMAND,
+    WaitMsBeforeAsync: 10000,
+    toolSummary: "Run sleep script",
+  },
+  ...(output === undefined
+    ? {}
+    : {
+        rawOutput: { output, exit_code: 0 },
+        content: [{ type: "content", content: { type: "text", text: output } }],
+      }),
+});
+const usageUpdate = (used: number): EffectAcpSchema.SessionUpdate => ({
+  sessionUpdate: "usage_update",
+  used,
+  size: 1048576,
+});
+
+const backgroundCommandHarness = Effect.fn("backgroundCommandHarness")(function* (
+  firstTurn: ReadonlyArray<EffectAcpSchema.SessionUpdate> = [
+    usageUpdate(10_000),
+    backgroundCommandUpdate("in_progress"),
+    {
+      sessionUpdate: "agent_message_chunk",
+      content: { type: "text", text: "The command is running in the background." },
+    },
+    usageUpdate(10_852),
+  ],
+) {
+  const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+  const path = yield* Path.Path;
+  const crypto = yield* SecureRandom.SecureRandom;
+  const mockAgentPath = yield* path.fromFileUrl(
+    new URL("../../../scripts/acp-mock-agent.ts", import.meta.url),
+  );
+  type RuntimeService = AcpSessionRuntime.AcpSessionRuntime["Service"];
+  let sessionUpdate: Parameters<RuntimeService["handleSessionUpdate"]>[0] | undefined;
+  let requestPermission: Parameters<RuntimeService["handleRequestPermission"]>[0] | undefined;
+  const offers = yield* Queue.unbounded<string>();
+  const cancels = yield* Ref.make(0);
+  const instanceId = ProviderInstanceId.make("antigravity-background-commands-test");
+  const threadId = ThreadId.make("thread-antigravity-background-commands");
+  const send = (update: EffectAcpSchema.SessionUpdate) =>
+    Effect.suspend(() =>
+      sessionUpdate === undefined
+        ? Effect.die("the adapter must handle updates")
+        : sessionUpdate(normalizeAntigravitySessionUpdate({ sessionId: "mock-session-1", update })),
+    );
+  const adapter = yield* makeAntigravityAdapterV2({
+    instanceId,
+    selfInvocation: yield* resolveSelfInvocation(),
+    continuationRequests: { offer: (request) => Queue.offer(offers, request.driver) },
+    makeRuntime: (input) =>
+      makeAntigravityAcpRuntime({
+        ...input,
+        childProcessSpawner,
+        spawn: {
+          command: process.execPath,
+          args: [mockAgentPath],
+          cwd: input.cwd,
+          env: { T3_ACP_ANTIGRAVITY: "1" },
+        },
+      }).pipe(
+        Effect.provideService(SecureRandom.SecureRandom, crypto),
+        Effect.map((runtime): RuntimeService => ({
+          ...runtime,
+          handleSessionUpdate: (handler) =>
+            Effect.sync(() => {
+              sessionUpdate = handler;
+            }).pipe(Effect.andThen(runtime.handleSessionUpdate(handler))),
+          handleRequestPermission: (handler) =>
+            Effect.sync(() => {
+              requestPermission = handler;
+            }).pipe(Effect.andThen(runtime.handleRequestPermission(handler))),
+          cancel: Ref.update(cancels, (count) => count + 1),
+          // By default the prompt returns `end_turn` while the command it started keeps running.
+          prompt: () =>
+            Effect.forEach(firstTurn, send, { discard: true }).pipe(
+              Effect.as({ stopReason: "end_turn" as const }),
+            ),
+        })),
+      ),
+    withProcess: (_stop, task) => task,
+    defaultModel: Effect.undefined,
+  });
+  const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+    runtimeMode: "full-access",
+    interactionMode: "default",
+    cwd: process.cwd(),
+  });
+  const modelSelection = { instanceId, model: "gemini-test-low" } as const;
+  const session = yield* adapter.openSession({
+    threadId,
+    providerSessionId: ProviderSessionId.make("provider-session-antigravity-background"),
+    modelSelection,
+    runtimePolicy,
+  });
+  const providerThread = yield* session.ensureThread({ threadId, modelSelection, runtimePolicy });
+  const startTurn = (ordinal: number, continuation: boolean) =>
+    DateTime.now.pipe(
+      Effect.flatMap((now) =>
+        session.startTurn(
+          makeTurnInput({
+            threadId,
+            providerThread,
+            instanceId,
+            runtimePolicy,
+            now,
+            ordinal,
+            modelSelection,
+            ...(continuation
+              ? { messageCreatedBy: "agent", messageCreationSource: "provider" }
+              : {}),
+          }),
+        ),
+      ),
+    );
+  const eventsUntil = (stop: (event: ProviderAdapter.ProviderAdapterV2Event) => boolean) =>
+    session.events.pipe(
+      Stream.takeUntil(stop),
+      Stream.runCollect,
+      Effect.map((events) => Array.from(events)),
+    );
+  return {
+    session,
+    providerThread,
+    offers,
+    cancels,
+    send,
+    startTurn,
+    eventsUntil,
+    requestPermission: (update: EffectAcpSchema.ToolCallUpdate & { readonly title: string }) =>
+      Effect.suspend(() =>
+        requestPermission === undefined
+          ? Effect.die("the adapter must handle permission requests")
+          : requestPermission(
+              {
+                sessionId: "mock-session-1",
+                toolCall: update,
+                options: [
+                  { optionId: "allow", name: "Allow", kind: "allow_once" },
+                  { optionId: "deny", name: "Deny", kind: "reject_once" },
+                ],
+              },
+              { requestId: "permission-1", method: "session/request_permission" },
+            ),
+      ),
+  };
+});
+
+const commandItem = (events: ReadonlyArray<ProviderAdapter.ProviderAdapterV2Event>) =>
+  events.findLast(
+    (event) =>
+      event.type === "turn_item.updated" &&
+      event.turnItem.nativeItemRef?.nativeId === "call_background",
+  );
+const lastRoster = (events: ReadonlyArray<ProviderAdapter.ProviderAdapterV2Event>) =>
+  events.findLast(
+    (event) =>
+      event.type === "provider_thread.updated" &&
+      event.providerThread.pendingBackgroundTasks !== undefined,
+  );
+
+describe("AntigravityAdapterV2 background commands", () => {
+  it.effect("still ends a turn whose native subagent call already returned", () =>
+    Effect.gen(function* () {
+      const harness = yield* backgroundCommandHarness([
+        {
+          sessionUpdate: "tool_call",
+          toolCallId: "trajectory:4",
+          title: "Running start_subagent",
+          kind: "other",
+          status: "completed",
+          rawOutput: "Started two agents.",
+        },
+        usageUpdate(10_000),
+      ]);
+      yield* harness.startTurn(1, false);
+      const events = yield* harness.eventsUntil((event) => event.type === "turn.terminal");
+      const terminal = events.at(-1);
+      assert.equal(terminal?.type === "turn.terminal" ? terminal.status : null, "completed");
+    }).pipe(Effect.provide(layerSession)),
+  );
+
+  it.effect("keeps a backgrounded command awaited and answers its reaction in a new run", () =>
+    Effect.gen(function* () {
+      const harness = yield* backgroundCommandHarness();
+      yield* harness.startTurn(1, false);
+      const first = yield* harness.eventsUntil((event) => event.type === "turn.terminal");
+      const terminal = first.at(-1);
+      assert.equal(terminal?.type === "turn.terminal" ? terminal.status : null, "completed");
+      // The run ends, but the command stays open and holds the thread as awaited work.
+      const running = commandItem(first);
+      assert.isTrue(
+        running?.type === "turn_item.updated" &&
+          isOrchestrationV2WorkActive(running.turnItem.status),
+      );
+      // A restart that kills it reports the loss as work the agent was waiting on.
+      assert.equal(
+        running?.type === "turn_item.updated" && running.turnItem.type === "command_execution"
+          ? running.turnItem.completionWake
+          : null,
+        "always",
+      );
+      const roster = lastRoster(first);
+      assert.deepEqual(
+        roster?.type === "provider_thread.updated"
+          ? roster.providerThread.pendingBackgroundTasks
+          : null,
+        [
+          {
+            taskId: "call_background",
+            kind: "command",
+            awaited: true,
+            command: BACKGROUND_COMMAND,
+            description: "Run sleep script",
+            runId: RunId.make(`run:thread-antigravity-background-commands:1`),
+          },
+        ],
+      );
+
+      // The command's end lands on its own row and asks for a run for the agent's reaction.
+      yield* harness.send(backgroundCommandUpdate("completed", "Command exited with code 0.\n"));
+      assert.equal(yield* Queue.take(harness.offers), "antigravity");
+      yield* harness.send({
+        sessionUpdate: "agent_thought_chunk",
+        content: { type: "text", text: "The command completed. Writing result.txt." },
+      });
+      const write = {
+        sessionUpdate: "tool_call",
+        toolCallId: "call_write",
+        kind: "edit",
+        title: "File result.txt",
+        status: "pending",
+        rawInput: { Path: "result.txt", Content: "done\n" },
+      } as const;
+      yield* harness.send(write);
+      // The reaction asks before T3 has a run for it; the answer waits for that run.
+      const permission = yield* harness.requestPermission(write).pipe(Effect.forkScoped);
+      yield* harness.startTurn(2, true);
+      assert.deepEqual(yield* Fiber.join(permission), {
+        outcome: { outcome: "selected", optionId: "allow" },
+      });
+      yield* harness.send({ ...write, sessionUpdate: "tool_call_update", status: "completed" });
+      yield* harness.send({
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: "finished" },
+      });
+      // Mid-step quiet does not end the reaction; only a finished model step does.
+      yield* TestClock.adjust("30 seconds");
+      yield* harness.send(usageUpdate(12_014));
+      yield* TestClock.adjust("3 seconds");
+      const second = yield* harness.eventsUntil((event) => event.type === "turn.terminal");
+      const settled = second.at(-1);
+      assert.equal(settled?.type === "turn.terminal" ? settled.status : null, "completed");
+      assert.equal(settled?.type === "turn.terminal" ? settled.runOrdinal : null, 2);
+      const usageIndex = second.findIndex(
+        (event) =>
+          event.type === "provider_thread.updated" &&
+          event.providerThread.contextUsage?.usedTokens === 12_014,
+      );
+      assert.isAbove(usageIndex, -1);
+      const assistant = second.findLast(
+        (event) =>
+          event.type === "turn_item.updated" && event.turnItem.type === "assistant_message",
+      );
+      assert.equal(
+        assistant?.type === "turn_item.updated" && assistant.turnItem.type === "assistant_message"
+          ? assistant.turnItem.text
+          : null,
+        "finished",
+      );
+      const completedCommand = commandItem([...first, ...second]);
+      assert.equal(
+        completedCommand?.type === "turn_item.updated" ? completedCommand.turnItem.status : null,
+        "completed",
+      );
+      // The reaction's run took the owed wake, so nothing holds the thread now.
+      const released = lastRoster(second);
+      assert.deepEqual(
+        released?.type === "provider_thread.updated"
+          ? released.providerThread.pendingBackgroundTasks
+          : null,
+        [],
+      );
+      assert.isFalse(yield* harness.session.hasPendingBackgroundWork!);
+    }).pipe(Effect.provide(layerSession)),
+  );
+
+  it.effect("lets the agent release a command it leaves running, by its own task id", () =>
+    Effect.gen(function* () {
+      const harness = yield* backgroundCommandHarness();
+      yield* harness.startTurn(1, false);
+      yield* harness.eventsUntil((event) => event.type === "turn.terminal");
+      const awaitTasks = harness.session.awaitBackgroundTasks!;
+      // The agent knows only `<conversation>/task-N`, which never reaches the wire.
+      const released = yield* awaitTasks({
+        providerThread: harness.providerThread,
+        taskIds: ["conversation-1/task-7"],
+        awaited: false,
+      });
+      assert.deepEqual(released.matched, ["call_background"]);
+      const unheld = lastRoster(
+        yield* harness.eventsUntil((event) => event.type === "provider_thread.updated"),
+      );
+      assert.deepEqual(
+        unheld?.type === "provider_thread.updated"
+          ? unheld.providerThread.pendingBackgroundTasks?.map((task) => task.awaited)
+          : null,
+        [undefined],
+      );
+      // A dev server it leaves running still keeps its process.
+      assert.isTrue(yield* harness.session.hasPendingBackgroundWork!);
+      const waited = yield* awaitTasks({
+        providerThread: harness.providerThread,
+        taskIds: ["call_background", "call_unknown"],
+        awaited: true,
+      });
+      assert.deepEqual(waited.matched, ["call_background"]);
+    }).pipe(Effect.provide(layerSession)),
+  );
+
+  it.effect("Stop kills a backgrounded command between runs and nothing wakes later", () =>
+    Effect.gen(function* () {
+      const harness = yield* backgroundCommandHarness();
+      yield* harness.startTurn(1, false);
+      const first = yield* harness.eventsUntil((event) => event.type === "turn.terminal");
+      const terminal = first.at(-1);
+      assert.equal(terminal?.type, "turn.terminal");
+      if (terminal?.type !== "turn.terminal") return;
+      yield* harness.session.interruptTurn({
+        providerThread: harness.providerThread,
+        providerTurnId: terminal.providerTurnId,
+      });
+      assert.equal(yield* Ref.get(harness.cancels), 1);
+      const stopped = yield* harness.eventsUntil(
+        (event) =>
+          event.type === "provider_thread.updated" &&
+          event.providerThread.pendingBackgroundTasks?.length === 0,
+      );
+      const command = commandItem(stopped);
+      assert.equal(
+        command?.type === "turn_item.updated" ? command.turnItem.status : null,
+        "interrupted",
+      );
+      // The agent's own failure report for the killed task must not start a run.
+      yield* harness.send(backgroundCommandUpdate("failed"));
+      yield* harness.send({
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: "The command was cancelled." },
+      });
+      assert.equal(yield* Queue.size(harness.offers), 0);
+      assert.isFalse(yield* harness.session.hasPendingBackgroundWork!);
     }).pipe(Effect.provide(layerSession)),
   );
 });

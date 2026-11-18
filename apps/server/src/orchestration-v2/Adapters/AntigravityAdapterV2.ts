@@ -39,6 +39,7 @@ import {
   antigravitySubagentOutput,
   classifyAntigravitySubagentToolCall,
   extractAntigravityUserInputQuestion,
+  makeAntigravityBackgroundCommands,
   makeAntigravityReadRepair,
   makeAntigravityUserInputResponse,
   normalizeAntigravityToolCall,
@@ -124,6 +125,12 @@ const extractAntigravitySubagentUpdate: NonNullable<AcpAdapterV2Flavor["extractS
   };
 };
 
+// Native subagents run hidden inside the agent, with no row, status or Stop in T3.
+const ANTIGRAVITY_T3_INSTRUCTIONS_NOTE = `## Antigravity in T3 Code
+
+- Subagents: always \`delegate_task\`, also for your own provider and model, so the user can watch and stop each child in T3. Never \`invoke_subagent\`, \`start_subagent\`, \`swarm\` or \`run_workflow\` unless the user names one.
+- A \`run_command\` that goes to the background is tracked by T3, and you are woken in a new run when it ends. Ending your turn after launching one is fine; do not poll it. One you leave running on purpose, such as a dev server or watcher: call \`t3_background_wait\` with its task id and \`waiting=false\`.`;
+
 interface AntigravityFlavorServices {
   readonly random: SecureRandom.SecureRandom["Service"];
   readonly fileSystem: FileSystem.FileSystem;
@@ -135,6 +142,10 @@ export function makeAntigravityAcpAdapterFlavor(
   options: AntigravityAdapterV2Options & AntigravityFlavorServices,
 ): AcpAdapterV2Flavor {
   const { profileDirectory } = options;
+  // Each runtime tracks its own open commands; their ids are unique, so the result is shared.
+  const backgroundedCommandIds = new Set<string>();
+  const backgroundCommandTaskId = (toolCall: { readonly toolCallId: string }) =>
+    backgroundedCommandIds.has(toolCall.toolCallId) ? toolCall.toolCallId : undefined;
   const antigravityClientFileRoots = (cwd: string | null) =>
     cwd === null ? [options.host.paths.attachmentsDir] : [cwd, options.host.paths.attachmentsDir];
   const makeRuntime = Effect.fn("AntigravityAdapterV2.makeRuntime")(
@@ -153,6 +164,7 @@ export function makeAntigravityAcpAdapterFlavor(
         .pipe(Effect.provideService(Scope.Scope, scope));
       // Repair keeps state across updates, so each runtime must have one session-update handler.
       const reads = makeAntigravityReadRepair();
+      const backgroundCommands = makeAntigravityBackgroundCommands(backgroundedCommandIds);
       // Served reads are reported from the read handler, so they take turns with agent updates.
       const updates = yield* Semaphore.make(1);
       let projectUpdate: Parameters<typeof runtime.handleSessionUpdate>[0] | undefined;
@@ -180,11 +192,32 @@ export function makeAntigravityAcpAdapterFlavor(
             ),
           ),
         prompt: (payload, promptOptions) =>
-          Effect.sync(reads.reset).pipe(Effect.andThen(runtime.prompt(payload, promptOptions))),
+          Effect.sync(reads.reset).pipe(
+            Effect.andThen(runtime.prompt(payload, promptOptions)),
+            // Marking and re-reporting share the update lock, so the adapter settles this turn
+            // only after every backgrounded command is registered as one.
+            Effect.tap(() =>
+              updates.withPermit(
+                Effect.suspend(() => {
+                  const project = projectUpdate;
+                  const marked = backgroundCommands.promptSettled();
+                  return project === undefined
+                    ? Effect.void
+                    : Effect.forEach(marked, project, { discard: true });
+                }),
+              ),
+            ),
+          ),
         handleSessionUpdate: (handler) => {
           projectUpdate = handler;
           return runtime.handleSessionUpdate((notification) =>
-            updates.withPermit(handler(reads.repair(notification))),
+            updates.withPermit(
+              Effect.suspend(() => {
+                const repaired = reads.repair(notification);
+                const marked = backgroundCommands.observe(repaired);
+                return Effect.forEach([...marked, repaired], handler, { discard: true });
+              }),
+            ),
           );
         },
         start: () =>
@@ -272,6 +305,16 @@ export function makeAntigravityAcpAdapterFlavor(
     },
     normalizeToolCall: normalizeAntigravityToolCall,
     extractSubagentUpdate: extractAntigravitySubagentUpdate,
+    extractBackgroundTaskId: backgroundCommandTaskId,
+    isBackgroundCommandTool: (toolCall) => backgroundCommandTaskId(toolCall) !== undefined,
+    // The agent reacts to every finished background task in a turn it starts itself.
+    deferFinalizeForBackgroundWork: true,
+    enablePostSettleContinuation: true,
+    backgroundCommandsWakeAgent: true,
+    // ACP v1 reactive turns have no end marker; each model step ends with a usage report.
+    continuationStepEnded: (update) => update.sessionUpdate === "usage_update",
+    continuationQuietFallback: "2 minutes",
+    t3InstructionsNote: ANTIGRAVITY_T3_INSTRUCTIONS_NOTE,
     supportsImagePrompts: true,
     // ACP 1.3.0 treats /compact as ordinary model input.
     supportsCompaction: false,
