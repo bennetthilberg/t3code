@@ -237,7 +237,8 @@ export function makeAntigravityAcpAdapterFlavor(
             ...input,
             clientFileReads: true,
             sessionSystemPromptAppend: PULL_REQUEST_LINKING_INSTRUCTIONS,
-            additionalDirectories: [options.host.paths.attachmentsDir],
+            // No added directories: the agent would run every command that names no `Cwd` there.
+            // Attachment reads still work, as T3 serves them and allows read requests.
           }),
         )
         .pipe(Effect.provideService(Scope.Scope, scope));

@@ -351,17 +351,25 @@ describe("AntigravityAdapterV2 client file system", () => {
         runtimePolicy,
       });
       yield* session.ensureThread({ threadId, modelSelection, runtimePolicy });
-      const initialize = (yield* fileSystem.readFileString(requestLog))
+      const requests = (yield* fileSystem.readFileString(requestLog))
         .trim()
         .split("\n")
         .map(
           (line) =>
             JSON.parse(line) as {
               method?: string;
-              params?: { clientCapabilities?: { fs?: unknown }; clientInfo?: { name?: string } };
+              params?: {
+                clientCapabilities?: { fs?: unknown };
+                clientInfo?: { name?: string };
+                additionalDirectories?: ReadonlyArray<string>;
+              };
             },
-        )
-        .find((request) => request.method === "initialize");
+        );
+      const initialize = requests.find((request) => request.method === "initialize");
+      // The agent runs a command that names no directory in an added directory, not in `cwd`.
+      assert.isUndefined(
+        requests.find((request) => request.method === "session/new")?.params?.additionalDirectories,
+      );
       assert.deepEqual(initialize?.params?.clientCapabilities?.fs, {
         readTextFile: true,
         writeTextFile: false,
