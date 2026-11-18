@@ -9683,6 +9683,20 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                   detail: `Provider turn ${turnInput.providerTurnId} is not active and cannot be steered.`,
                 });
               }
+              // Sent before the turn's own prompt, a steer would reach the agent as that prompt.
+              // A run the agent started itself has no prompt to wait for.
+              if (!context.isContinuation) {
+                const dispatched = yield* Effect.raceFirst(
+                  Deferred.await(context.promptDispatched).pipe(Effect.as(true)),
+                  Deferred.await(context.promptWireSettled).pipe(Effect.as(false)),
+                );
+                if (!dispatched) {
+                  return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+                    driver,
+                    detail: `Provider turn ${turnInput.providerTurnId} ended before it read the steering message.`,
+                  });
+                }
+              }
               // An agent that drops an early cancel drops an early steer too.
               const startHold = flavor.cancelAfterPromptStarts;
               if (startHold !== undefined) {

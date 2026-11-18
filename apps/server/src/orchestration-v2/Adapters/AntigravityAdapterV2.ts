@@ -7,13 +7,17 @@ import {
 } from "@t3tools/contracts";
 import type { SelfInvocation } from "@t3tools/shared/nodeRuntime";
 import * as SecureRandom from "effect/crypto/SecureRandom";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Exit from "effect/Exit";
 import * as Semaphore from "effect/Semaphore";
+import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as EffectAcpErrors from "effect-acp/errors";
+import * as EffectAcpSchemaV1 from "effect-acp/schema-v1";
+import type * as EffectAcpSchema from "effect-acp/compat";
 
 import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
 import { PULL_REQUEST_LINKING_INSTRUCTIONS } from "@t3tools/provider-core/server/runtimeInstructions";
@@ -61,6 +65,11 @@ const AntigravityProviderCapabilitiesV2 = {
     ...AcpProviderCapabilitiesV2.sessions,
     supportsModelSwitchInSession: true,
     supportsRuntimeModeSwitchInSession: true,
+  },
+  turns: {
+    ...AcpProviderCapabilitiesV2.turns,
+    supportsActiveSteering: true,
+    activeSteeringInterruptsTools: false,
   },
   tools: {
     ...AcpProviderCapabilitiesV2.tools,
@@ -132,6 +141,68 @@ const ANTIGRAVITY_T3_INSTRUCTIONS_NOTE = `## Antigravity in T3 Code
 - Subagents: always \`delegate_task\`, also for your own provider and model, so the user can watch and stop each child in T3. Never \`invoke_subagent\`, \`start_subagent\`, \`swarm\` or \`run_workflow\` unless the user names one.
 - A \`run_command\` that goes to the background is tracked by T3, and you are woken in a new run when it ends. Ending your turn after launching one is fine; do not poll it. One you leave running on purpose, such as a dev server or watcher: call \`t3_background_wait\` with its task id and \`waiting=false\`.`;
 
+interface OpenAntigravityPrompt {
+  steered: Deferred.Deferred<EffectAcpSchema.PromptResponse, EffectAcpErrors.AcpError> | undefined;
+}
+
+type PromptUsage = NonNullable<EffectAcpSchema.PromptResponse["usage"]>;
+
+const addOptionalTokens = (left: number | null | undefined, right: number | null | undefined) =>
+  left == null && right == null ? {} : { value: (left ?? 0) + (right ?? 0) };
+
+// Each prompt reports only its own share of the turn's tokens.
+function addPromptUsage(
+  left: PromptUsage | null | undefined,
+  right: PromptUsage | null | undefined,
+): PromptUsage | null | undefined {
+  if (left == null) return right;
+  if (right == null) return left;
+  const thought = addOptionalTokens(left.thoughtTokens, right.thoughtTokens);
+  const cachedRead = addOptionalTokens(left.cachedReadTokens, right.cachedReadTokens);
+  const cachedWrite = addOptionalTokens(left.cachedWriteTokens, right.cachedWriteTokens);
+  return {
+    ...right,
+    totalTokens: left.totalTokens + right.totalTokens,
+    inputTokens: left.inputTokens + right.inputTokens,
+    outputTokens: left.outputTokens + right.outputTokens,
+    ...("value" in thought ? { thoughtTokens: thought.value } : {}),
+    ...("value" in cachedRead ? { cachedReadTokens: cachedRead.value } : {}),
+    ...("value" in cachedWrite ? { cachedWriteTokens: cachedWrite.value } : {}),
+  };
+}
+
+/** Each steer ends the prompt before it with `end_turn`; the turn ends with the last one. */
+const awaitSteeredPrompts = (
+  open: OpenAntigravityPrompt,
+  response: EffectAcpSchema.PromptResponse,
+): Effect.Effect<EffectAcpSchema.PromptResponse, EffectAcpErrors.AcpError> => {
+  const steered = open.steered;
+  if (steered === undefined) return Effect.succeed(response);
+  open.steered = undefined;
+  return Deferred.await(steered).pipe(
+    Effect.flatMap((next) => {
+      const usage = addPromptUsage(response.usage, next.usage);
+      return awaitSteeredPrompts(open, usage == null ? next : { ...next, usage });
+    }),
+  );
+};
+
+const decodePromptResponse = Schema.decodeUnknownEffect(EffectAcpSchemaV1.PromptResponse);
+
+const decodeSteeredPromptResponse = (response: unknown) =>
+  decodePromptResponse(response).pipe(
+    Effect.mapError(
+      (cause) =>
+        new EffectAcpErrors.AcpRequestError({
+          code: -32603,
+          errorMessage: "Antigravity answered a steered prompt in an unknown shape.",
+          method: "session/prompt",
+          data: response,
+          cause,
+        }),
+    ),
+  );
+
 interface AntigravityFlavorServices {
   readonly random: SecureRandom.SecureRandom["Service"];
   readonly fileSystem: FileSystem.FileSystem;
@@ -149,6 +220,11 @@ export function makeAntigravityAcpAdapterFlavor(
   const backgroundedCommandIds = new Set<string>();
   const backgroundCommandTaskId = (toolCall: { readonly toolCallId: string }) =>
     backgroundedCommandIds.has(toolCall.toolCallId) ? toolCall.toolCallId : undefined;
+  // Steering needs the runtime's own open prompt, so each wrapped runtime registers its sender.
+  const steerers = new WeakMap<
+    AcpSessionRuntime.AcpSessionRuntime["Service"],
+    (sessionId: string, prompt: ReadonlyArray<EffectAcpSchema.ContentBlock>) => Effect.Effect<void>
+  >();
   const antigravityClientFileRoots = (cwd: string | null) =>
     cwd === null ? [options.host.paths.attachmentsDir] : [cwd, options.host.paths.attachmentsDir];
   const makeRuntime = Effect.fn("AntigravityAdapterV2.makeRuntime")(
@@ -171,7 +247,10 @@ export function makeAntigravityAcpAdapterFlavor(
       // Served reads are reported from the read handler, so they take turns with agent updates.
       const updates = yield* Semaphore.make(1);
       let projectUpdate: Parameters<typeof runtime.handleSessionUpdate>[0] | undefined;
-      return {
+      // A prompt sent mid-turn ends the open prompt with `end_turn` and carries the turn on,
+      // so the open prompt answers with the last steered prompt's response instead.
+      let openPrompt: OpenAntigravityPrompt | undefined;
+      const wrapped = {
         ...runtime,
         handleReadTextFile: (handler) =>
           runtime.handleReadTextFile((request, context) =>
@@ -195,8 +274,19 @@ export function makeAntigravityAcpAdapterFlavor(
             ),
           ),
         prompt: (payload, promptOptions) =>
-          Effect.sync(reads.reset).pipe(
-            Effect.andThen(runtime.prompt(payload, promptOptions)),
+          Effect.suspend(() => {
+            const open: OpenAntigravityPrompt = { steered: undefined };
+            openPrompt = open;
+            reads.reset();
+            return runtime.prompt(payload, promptOptions).pipe(
+              Effect.flatMap((response) => awaitSteeredPrompts(open, response)),
+              Effect.ensuring(
+                Effect.sync(() => {
+                  if (openPrompt === open) openPrompt = undefined;
+                }),
+              ),
+            );
+          }).pipe(
             // Marking and re-reporting share the update lock, so the adapter settles this turn
             // only after every backgrounded command is registered as one.
             Effect.tap(() =>
@@ -232,6 +322,23 @@ export function makeAntigravityAcpAdapterFlavor(
               ),
             ),
       } satisfies typeof runtime;
+      steerers.set(wrapped, (sessionId, prompt) =>
+        Effect.gen(function* () {
+          const steered = yield* Deferred.make<
+            EffectAcpSchema.PromptResponse,
+            EffectAcpErrors.AcpError
+          >();
+          // With no prompt open, as in a run the agent started itself, step ends settle the run.
+          if (openPrompt !== undefined) openPrompt.steered = steered;
+          yield* runtime.request("session/prompt", { sessionId, prompt }).pipe(
+            Effect.flatMap(decodeSteeredPromptResponse),
+            Effect.exit,
+            Effect.flatMap((exit) => Deferred.done(steered, exit)),
+            Effect.forkIn(scope),
+          );
+        }),
+      );
+      return wrapped;
     },
     Effect.provideService(SecureRandom.SecureRandom, options.random),
     Effect.mapError((cause): EffectAcpErrors.AcpError =>
@@ -326,6 +433,20 @@ export function makeAntigravityAcpAdapterFlavor(
               Effect.provideService(FileSystem.FileSystem, options.fileSystem),
             ),
         }),
+    steering: {
+      send: (runtime, sessionId, text, images) => {
+        const steer = steerers.get(runtime);
+        return steer === undefined
+          ? Effect.fail(
+              new EffectAcpErrors.AcpRequestError({
+                code: -32603,
+                errorMessage: "This Antigravity runtime cannot steer.",
+                method: "session/prompt",
+              }),
+            )
+          : steer(sessionId, [{ type: "text", text }, ...images]).pipe(Effect.as(undefined));
+      },
+    },
     supportsImagePrompts: true,
     // ACP 1.3.0 treats /compact as ordinary model input.
     supportsCompaction: false,

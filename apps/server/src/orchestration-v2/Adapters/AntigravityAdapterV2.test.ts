@@ -1112,17 +1112,28 @@ const usageUpdate = (used: number): EffectAcpSchema.SessionUpdate => ({
 });
 
 const backgroundCommandHarness = Effect.fn("backgroundCommandHarness")(function* (
-  firstTurn: ReadonlyArray<EffectAcpSchema.SessionUpdate> = [
-    usageUpdate(10_000),
-    backgroundCommandUpdate("in_progress"),
-    {
-      sessionUpdate: "agent_message_chunk",
-      content: { type: "text", text: "The command is running in the background." },
-    },
-    usageUpdate(10_852),
-  ],
-  profileDirectory?: string,
+  options: {
+    readonly firstTurn?: ReadonlyArray<EffectAcpSchema.SessionUpdate>;
+    readonly profileDirectory?: string;
+    /** Like antigravity-acp, the first prompt ends with `end_turn` once a second one arrives. */
+    readonly endPromptOnSteer?: boolean;
+  } = {},
 ) {
+  const {
+    firstTurn = [
+      usageUpdate(10_000),
+      backgroundCommandUpdate("in_progress"),
+      {
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: "The command is running in the background." },
+      },
+      usageUpdate(10_852),
+    ],
+    profileDirectory,
+  } = options;
+  const steers = yield* Queue.unbounded<unknown>();
+  const steerArrived = yield* Deferred.make<void>();
+  const steerAnswer = yield* Deferred.make<EffectAcpSchema.PromptResponse>();
   const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const path = yield* Path.Path;
   const crypto = yield* SecureRandom.SecureRandom;
@@ -1170,10 +1181,24 @@ const backgroundCommandHarness = Effect.fn("backgroundCommandHarness")(function*
             }).pipe(Effect.andThen(runtime.handleRequestPermission(handler))),
           cancel: Ref.update(cancels, (count) => count + 1),
           // By default the prompt returns `end_turn` while the command it started keeps running.
-          prompt: () =>
-            Effect.forEach(firstTurn, send, { discard: true }).pipe(
+          prompt: (_payload, promptOptions) =>
+            (promptOptions?.dispatched === undefined
+              ? Effect.void
+              : Deferred.succeed(promptOptions.dispatched, undefined)
+            ).pipe(
+              Effect.andThen(Effect.forEach(firstTurn, send, { discard: true })),
+              Effect.andThen(
+                options.endPromptOnSteer === true ? Deferred.await(steerArrived) : Effect.void,
+              ),
               Effect.as({ stopReason: "end_turn" as const }),
             ),
+          request: (method, payload) =>
+            method === "session/prompt"
+              ? Queue.offer(steers, payload).pipe(
+                  Effect.andThen(Deferred.succeed(steerArrived, undefined)),
+                  Effect.andThen(Deferred.await(steerAnswer)),
+                )
+              : runtime.request(method, payload),
         })),
       ),
     withProcess: (_stop, task) => task,
@@ -1223,6 +1248,9 @@ const backgroundCommandHarness = Effect.fn("backgroundCommandHarness")(function*
     providerThread,
     offers,
     cancels,
+    steers,
+    answerSteer: (response: EffectAcpSchema.PromptResponse) =>
+      Deferred.succeed(steerAnswer, response),
     send,
     startTurn,
     eventsUntil,
@@ -1261,17 +1289,19 @@ const lastRoster = (events: ReadonlyArray<ProviderAdapter.ProviderAdapterV2Event
 describe("AntigravityAdapterV2 background commands", () => {
   it.effect("still ends a turn whose native subagent call already returned", () =>
     Effect.gen(function* () {
-      const harness = yield* backgroundCommandHarness([
-        {
-          sessionUpdate: "tool_call",
-          toolCallId: "trajectory:4",
-          title: "Running start_subagent",
-          kind: "other",
-          status: "completed",
-          rawOutput: "Started two agents.",
-        },
-        usageUpdate(10_000),
-      ]);
+      const harness = yield* backgroundCommandHarness({
+        firstTurn: [
+          {
+            sessionUpdate: "tool_call",
+            toolCallId: "trajectory:4",
+            title: "Running start_subagent",
+            kind: "other",
+            status: "completed",
+            rawOutput: "Started two agents.",
+          },
+          usageUpdate(10_000),
+        ],
+      });
       yield* harness.startTurn(1, false);
       const events = yield* harness.eventsUntil((event) => event.type === "turn.terminal");
       const terminal = events.at(-1);
@@ -1297,7 +1327,7 @@ describe("AntigravityAdapterV2 background commands", () => {
       );
       yield* fileSystem.makeDirectory(tasks, { recursive: true });
       yield* fileSystem.writeFileString(path.join(tasks, "task-2.log"), "warming up\r\n");
-      const harness = yield* backgroundCommandHarness(undefined, profile);
+      const harness = yield* backgroundCommandHarness({ profileDirectory: profile });
       yield* harness.startTurn(1, false);
       const first = yield* harness.eventsUntil((event) => event.type === "turn.terminal");
       const terminal = first.at(-1);
@@ -1476,6 +1506,69 @@ describe("AntigravityAdapterV2 background commands", () => {
       });
       assert.equal(yield* Queue.size(harness.offers), 0);
       assert.isFalse(yield* harness.session.hasPendingBackgroundWork!);
+    }).pipe(Effect.provide(layerSession)),
+  );
+});
+
+describe("AntigravityAdapterV2 steering", () => {
+  it.effect("steers a running turn without stopping it or its command", () =>
+    Effect.gen(function* () {
+      const harness = yield* backgroundCommandHarness({
+        firstTurn: [usageUpdate(10_000), backgroundCommandUpdate("in_progress")],
+        endPromptOnSteer: true,
+      });
+      yield* harness.startTurn(1, false);
+      const started = (yield* harness.eventsUntil(
+        (event) => event.type === "provider_turn.updated",
+      )).at(-1);
+      assert.equal(started?.type, "provider_turn.updated");
+      if (started?.type !== "provider_turn.updated") return;
+      yield* harness.session.steerTurn({
+        threadId: ThreadId.make("thread-antigravity-background-commands"),
+        runId: RunId.make("run:thread-antigravity-background-commands:1"),
+        providerThread: harness.providerThread,
+        providerTurnId: started.providerTurn.id,
+        message: {
+          messageId: MessageId.make("antigravity-steer"),
+          createdBy: "user",
+          creationSource: "web",
+          text: "Also end your reply with BANANA.",
+          attachments: [],
+        },
+      });
+      // A second prompt is how the agent takes a message mid-turn; a cancel would kill the command.
+      assert.deepEqual(yield* Queue.take(harness.steers), {
+        sessionId: "mock-session-1",
+        prompt: [{ type: "text", text: "Also end your reply with BANANA." }],
+      });
+      assert.equal(yield* Ref.get(harness.cancels), 0);
+
+      // The first prompt has ended, but the turn lasts until the steered prompt does.
+      yield* harness.send(backgroundCommandUpdate("completed", "Command exited with code 0.\n"));
+      yield* harness.send({
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: "The command finished. BANANA" },
+      });
+      yield* TestClock.adjust("10 seconds");
+      const working = yield* harness.eventsUntil(
+        (event) =>
+          event.type === "turn_item.updated" &&
+          event.turnItem.nativeItemRef?.nativeId === "call_background" &&
+          event.turnItem.status === "completed",
+      );
+      assert.isFalse(working.some((event) => event.type === "turn.terminal"));
+
+      yield* harness.answerSteer({ stopReason: "end_turn" });
+      yield* TestClock.adjust("3 seconds");
+      const rest = yield* harness.eventsUntil((event) => event.type === "turn.terminal");
+      const terminal = rest.at(-1);
+      assert.equal(terminal?.type === "turn.terminal" ? terminal.status : null, "completed");
+      assert.equal(terminal?.type === "turn.terminal" ? terminal.runOrdinal : null, 1);
+      const command = commandItem([...working, ...rest]);
+      assert.equal(
+        command?.type === "turn_item.updated" ? command.turnItem.status : null,
+        "completed",
+      );
     }).pipe(Effect.provide(layerSession)),
   );
 });
